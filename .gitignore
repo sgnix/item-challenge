@@ -34,3 +34,6 @@ yarn-error.log*
 
 # Testing
 coverage/
+
+pnpm-workspace.yaml
+
