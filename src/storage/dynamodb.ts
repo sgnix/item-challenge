@@ -1,44 +1,74 @@
 /**
  * DynamoDB Storage Implementation (Optional)
  *
- * This implementation uses AWS DynamoDB for persistent storage.
+ * Selected when USE_DYNAMODB=true; otherwise the factory uses MemoryStorage.
  *
- * To use this:
- * 1. Set environment variable: USE_DYNAMODB=true
- * 2. Configure AWS credentials (or use DynamoDB Local)
- * 3. Set DYNAMODB_TABLE_NAME (or use default "ExamItems")
+ * Schema (see ARCHITECTURE.md):
+ *   pk = ITEM#<id>, sk = CURRENT | VERSION#<padded>
+ *   gsi1: gsi1pk = SUBJECT#<subject>, gsi1sk = STATUS#<status>#<lastModified>
+ *   sparse on gsi1: only CURRENT rows carry gsi1pk/gsi1sk
  *
- * For DynamoDB Local:
- * - Download from: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html
- * - Run: java -Djava.library.path=./DynamoDBLocal_lib -jar DynamoDBLocal.jar -sharedDb
- * - Set DYNAMODB_ENDPOINT=http://localhost:8000
+ * For DynamoDB Local: DYNAMODB_ENDPOINT=http://localhost:8000
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
-  PutCommand,
+  TransactWriteCommand,
   GetCommand,
-  UpdateCommand,
+  QueryCommand,
   ScanCommand,
-  QueryCommand
 } from '@aws-sdk/lib-dynamodb';
 import { randomUUID } from 'crypto';
 import { ExamItem, CreateItemRequest, UpdateItemRequest, ListItemsQuery } from '../types/item.js';
 import { ItemStorage } from './interface.js';
+import { merge } from 'lodash';
+
+interface Row extends ExamItem {
+  pk: string;
+  sk: string;
+  gsi1pk?: string;
+  gsi1sk?: string;
+}
+
+const VERSION_PAD = 6;
+const versionSk = (n: number) => `VERSION#${String(n).padStart(VERSION_PAD, '0')}`;
+const itemPk = (id: string) => `ITEM#${id}`;
+const subjectPk = (subject: string) => `SUBJECT#${subject}`;
+const statusSk = (status: string, lastModified: number) =>
+  `STATUS#${status}#${lastModified}`;
+
+const toCurrentRow = (item: ExamItem): Row => ({
+  ...item,
+  pk: itemPk(item.id),
+  sk: 'CURRENT',
+  gsi1pk: subjectPk(item.subject),
+  gsi1sk: statusSk(item.metadata.status, item.metadata.lastModified),
+});
+
+// Snapshots intentionally omit gsi1pk/gsi1sk so subject queries against gsi1
+// don't return CURRENT plus every historical version of every match.
+const toVersionRow = (item: ExamItem): Row => ({
+  ...item,
+  pk: itemPk(item.id),
+  sk: versionSk(item.metadata.version),
+});
+
+const stripKeys = (row: Record<string, unknown>): ExamItem => {
+  const { pk: _p, sk: _s, gsi1pk: _gp, gsi1sk: _gs, ...item } = row;
+  return item as unknown as ExamItem;
+};
 
 export class DynamoDBStorage implements ItemStorage {
   private client: DynamoDBDocumentClient;
   private tableName: string;
 
-  constructor() {
-    const dynamoClient = new DynamoDBClient({
-      region: process.env.AWS_REGION || 'us-east-1',
-      ...(process.env.DYNAMODB_ENDPOINT && { endpoint: process.env.DYNAMODB_ENDPOINT }),
-    });
-
-    this.client = DynamoDBDocumentClient.from(dynamoClient);
-    this.tableName = process.env.DYNAMODB_TABLE_NAME || 'ExamItems';
+  constructor(client?: DynamoDBDocumentClient, tableName?: string) {
+    this.client = client ?? DynamoDBDocumentClient.from(new DynamoDBClient({
+      region: process.env.AWS_REGION ?? 'us-east-1',
+      ...(process.env.DYNAMODB_ENDPOINT ? { endpoint: process.env.DYNAMODB_ENDPOINT } : {}),
+    }));
+    this.tableName = tableName ?? process.env.DYNAMODB_TABLE_NAME ?? 'ExamItems';
   }
 
   async createItem(data: CreateItemRequest): Promise<ExamItem> {
@@ -54,9 +84,22 @@ export class DynamoDBStorage implements ItemStorage {
       },
     };
 
-    await this.client.send(new PutCommand({
-      TableName: this.tableName,
-      Item: item,
+    await this.client.send(new TransactWriteCommand({
+      TransactItems: [
+        {
+          Put: {
+            TableName: this.tableName,
+            Item: toCurrentRow(item),
+            ConditionExpression: 'attribute_not_exists(pk)',
+          },
+        },
+        {
+          Put: {
+            TableName: this.tableName,
+            Item: toVersionRow(item),
+          },
+        },
+      ],
     }));
 
     return item;
@@ -65,57 +108,62 @@ export class DynamoDBStorage implements ItemStorage {
   async getItem(id: string): Promise<ExamItem | null> {
     const result = await this.client.send(new GetCommand({
       TableName: this.tableName,
-      Key: { id },
+      Key: {
+        pk: itemPk(id),
+        sk: 'CURRENT',
+      },
     }));
 
-    return result.Item as ExamItem || null;
+    if (!result.Item) return null;
+    return stripKeys(result.Item);
   }
 
   async updateItem(id: string, data: UpdateItemRequest): Promise<ExamItem | null> {
-    const existing = await this.getItem(id);
-    if (!existing) return null;
+    const current = await this.getItem(id);
+    if (!current) return null;
+
+    const merged = merge({}, current, data);
 
     const updated: ExamItem = {
-      ...existing,
-      ...data,
-      content: data.content ? { ...existing.content, ...data.content } : existing.content,
+      ...merged,
+      content: merged.content,
       metadata: {
-        ...existing.metadata,
-        ...(data.metadata || {}),
+        ...merged.metadata,
         lastModified: Date.now(),
-        version: existing.metadata.version + 1,
+        version: current.metadata.version + 1,
       },
     };
 
-    await this.client.send(new PutCommand({
-      TableName: this.tableName,
-      Item: updated,
+    await this.client.send(new TransactWriteCommand({
+      TransactItems: [
+        {
+          Put: {
+            TableName: this.tableName,
+            Item: toCurrentRow(updated),
+            ConditionExpression: 'attribute_exists(pk)',
+          },
+        },
+        {
+          Put: {
+            TableName: this.tableName,
+            Item: toVersionRow(updated),
+          },
+        },
+      ],
     }));
 
     return updated;
   }
 
   async listItems(query: ListItemsQuery): Promise<{ items: ExamItem[]; total: number }> {
-    // Note: This is a basic implementation using Scan
-    // For production, you should use Query with appropriate indexes
-    const result = await this.client.send(new ScanCommand({
-      TableName: this.tableName,
-      Limit: query.limit || 10,
-    }));
-
-    const items = (result.Items || []) as ExamItem[];
-    return { items, total: result.Count || 0 };
+    throw new Error('Not implemented');
   }
 
   async createVersion(id: string): Promise<ExamItem | null> {
-    // TODO: Implement versioning strategy
-    // Options: Separate versions table, same table with sort key, etc.
-    throw new Error('Not implemented - define your versioning strategy');
+    throw new Error('Not implemented');
   }
 
   async getAuditTrail(id: string): Promise<ExamItem[]> {
-    // TODO: Implement audit trail retrieval
-    // This depends on your versioning strategy
-    throw new Error('Not implemented - define your audit trail strategy');
+    throw new Error('Not implemented');
   }
 }
